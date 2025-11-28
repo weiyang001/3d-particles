@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D 粒子宇宙交互系统</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        .input_video { display: none; }
+        
+        #ui-panel { 
+            position: absolute; top: 20px; right: 20px; width: 280px; 
+            padding: 20px; background: rgba(255, 255, 255, 0.1); 
+            backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); 
+            border-radius: 15px; border: 1px solid rgba(255, 255, 255, 0.2); 
+            color: white; z-index: 10; box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5); 
+        }
+
+        h2 { margin: 0 0 15px 0; font-size: 18px; text-align: center; letter-spacing: 1px; }
+        .control-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-size: 14px; color: #ccc; }
+        select, input[type="color"] { width: 100%; padding: 8px; border-radius: 5px; border: none; background: rgba(0, 0, 0, 0.5); color: white; outline: none; cursor: pointer; }
+        
+        /* 开关样式 */
+        .toggle-container { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; }
+        .toggle-label { font-size: 14px; color: #ccc; }
+        input[type="checkbox"] { width: 20px; height: 20px; cursor: pointer; accent-color: #1E90FF; }
+
+        .btn-group { display: flex; gap: 10px; margin-bottom: 10px; }
+        button { 
+            flex: 1; padding: 10px; border: none; border-radius: 5px; 
+            background: linear-gradient(45deg, #1E90FF, #3333ff); 
+            color: white; font-weight: bold; cursor: pointer; transition: all 0.2s; 
+        }
+        button:active { transform: scale(0.95); }
+        button.secondary { background: rgba(255,255,255,0.2); }
+        button.paused { background: #ffaa00; color: #000; }
+
+        #status { position: absolute; bottom: 20px; left: 20px; color: rgba(255, 255, 255, 0.5); z-index: 10; font-size: 12px; }
+        #loader { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; z-index: 20; font-size: 20px; pointer-events: none; }
+    </style>
+</head>
+<body>
+
+    <div id="loader">正在启动摄像头和模型...</div>
+    <video class="input_video"></video>
+    <div id="canvas-container"></div>
+
+    <div id="ui-panel">
+        <h2>🌌 宇宙粒子控制器</h2>
+        
+        <div class="control-group">
+            <label>选择模型</label>
+            <select id="shape-selector">
+                <option value="solar">☀️ 太阳系 (Solar System)</option>
+                <option value="heart">❤️ 爱心 (Heart)</option>
+                <option value="globe">🌍 地球仪 (Globe)</option>
+                <option value="saturn">🪐 土星 (Saturn)</option>
+                <option value="flower">🌸 花朵 (Flower)</option>
+                <option value="fireworks">🎆 烟花 (Fireworks)</option>
+            </select>
+        </div>
+
+        <div class="control-group">
+            <label>基础颜色 (仅单色模型)</label>
+            <!-- 默认颜色改为天际蓝 #1E90FF -->
+            <input type="color" id="color-picker" value="#1E90FF">
+        </div>
+
+        <div class="toggle-container">
+            <span class="toggle-label">🖐️ 允许手势扩散/爆炸</span>
+            <input type="checkbox" id="diffusion-toggle" checked>
+        </div>
+
+        <div class="btn-group">
+            <button id="reset-btn" class="secondary">↺ 重置</button>
+            <button id="pause-btn">⏸ 暂停识别</button>
+        </div>
+        <button id="fullscreen-btn">⛶ 全屏模式</button>
+
+        <div style="margin-top: 15px; font-size: 12px; color: #aaa; line-height: 1.5;">
+            <p>👋 <b>交互指南:</b></p>
+            <ul>
+                <li><b>单指滑动</b>: 惯性旋转模型</li>
+                <li><b>握紧拳头</b>: 触发爆炸 (需开启开关)</li>
+                <li><b>地球/太阳系</b>: 自动应用特殊配色</li>
+            </ul>
+        </div>
+    </div>
+
+    <div id="status">MediaPipe Hands & Three.js</div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <script>
+        // --- 1. 初始化变量 ---
+        const PARTICLE_COUNT = 16000; 
+        const PARTICLE_SIZE = 0.08;
+        // 默认模型改为太阳系
+        let currentShape = 'solar'; 
+        let targetPositions = [];
+        let particles;
+        let scene, camera, renderer;
+        // 默认颜色改为天际蓝
+        let userSelectedColor = new THREE.Color(0x1E90FF); 
+
+        // 交互状态
+        let isPaused = false;
+        let isDiffusionEnabled = true;
+        let handInteraction = { spread: 0, active: false };
+        
+        // 物理引擎
+        let targetRotation = { x: 0, y: 0 }; 
+        let momentum = { x: 0, y: 0 };
+        let previousHandPosition = { x: 0, y: 0 };
+        let isDragging = false;
+        const FRICTION = 0.95;
+
+        // --- 2. Three.js 场景设置 ---
+        function initThree() {
+            const container = document.getElementById('canvas-container');
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x050505, 0.02);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 5;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(PARTICLE_COUNT * 3);
+            const colors = new Float32Array(PARTICLE_COUNT * 3); 
+
+            const baseColor = userSelectedColor;
+            for(let i=0; i<PARTICLE_COUNT; i++) {
+                positions[i*3] = (Math.random() - 0.5) * 10;
+                positions[i*3+1] = (Math.random() - 0.5) * 10;
+                positions[i*3+2] = (Math.random() - 0.5) * 10;
+                
+                colors[i*3] = baseColor.r;
+                colors[i*3+1] = baseColor.g;
+                colors[i*3+2] = baseColor.b;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3)); 
+
+            const textureLoader = new THREE.TextureLoader();
+            const sprite = textureLoader.load('https://threejs.org/examples/textures/sprites/disc.png');
+
+            const material = new THREE.PointsMaterial({
+                size: PARTICLE_SIZE,
+                map: sprite,
+                vertexColors: true, 
+                transparent: true,
+                opacity: 0.8,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+
+            updateParticleSystem('solar'); // 初始加载太阳系
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        // --- 3. 形状与颜色生成核心算法 ---
+        function updateParticleSystem(type) {
+            const positions = [];
+            const colors = [];
+            
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                let x, y, z;
+                let r = userSelectedColor.r, g = userSelectedColor.g, b = userSelectedColor.b;
+
+                if (type === 'heart') {
+                    const t = Math.random() * Math.PI * 2;
+                    const scale = Math.sqrt(Math.random());
+                    let tx = 16 * Math.pow(Math.sin(t), 3);
+                    let ty = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+                    x = tx * scale * 0.15; y = ty * scale * 0.15; z = (Math.random() - 0.5) * 1.5 * scale;
+                } 
+                else if (type === 'globe') {
+                    const radius = 2.0;
+                    const phi = Math.acos(-1 + (2 * i) / PARTICLE_COUNT);
+                    const theta = Math.sqrt(PARTICLE_COUNT * Math.PI) * phi;
+                    x = radius * Math.cos(theta) * Math.sin(phi);
+                    y = radius * Math.sin(theta) * Math.sin(phi);
+                    z = radius * Math.cos(phi);
+                    const noise = Math.sin(x*2.5) + Math.sin(y*1.8) + Math.cos(z*2.2) + Math.sin(x*5 + y*5);
+                    if (noise > 0.8) { r = 0.2; g = 0.8 + Math.random()*0.2; b = 0.3; } 
+                    else { r = 0.0; g = 0.4 * Math.random(); b = 0.8 + Math.random()*0.2; }
+                }
+                else if (type === 'solar') {
+                    const rand = Math.random();
+                    if (rand < 0.15) {
+                        const rad = 0.6 * Math.random();
+                        const theta = Math.random() * Math.PI * 2;
+                        const phi = Math.random() * Math.PI;
+                        x = rad * Math.sin(phi) * Math.cos(theta);
+                        y = rad * Math.sin(phi) * Math.sin(theta);
+                        z = rad * Math.cos(phi);
+                        r = 1.0; g = 0.6 + Math.random()*0.4; b = 0.0;
+                    } else {
+                        const angle = Math.random() * Math.PI * 2;
+                        const orbitIndex = Math.floor(Math.random() * 6); 
+                        const orbitRadius = 1.0 + orbitIndex * 0.6 + (Math.random()-0.5)*0.3;
+                        x = Math.cos(angle) * orbitRadius;
+                        z = Math.sin(angle) * orbitRadius;
+                        y = (Math.random() - 0.5) * 0.1; 
+                        if (orbitIndex === 0) { r=0.7; g=0.7; b=0.7; } 
+                        else if (orbitIndex === 1) { r=0.9; g=0.8; b=0.4; } 
+                        else if (orbitIndex === 2) { r=0.0; g=0.5; b=1.0; } 
+                        else if (orbitIndex === 3) { r=1.0; g=0.2; b=0.0; } 
+                        else if (orbitIndex === 4) { r=0.8; g=0.6; b=0.4; } 
+                        else { r=0.6; g=0.6; b=1.0; } 
+                    }
+                }
+                else if (type === 'saturn') {
+                    const isRing = Math.random() > 0.6;
+                    if (isRing) {
+                        const angle = Math.random() * Math.PI * 2;
+                        const radius = 2.5 + Math.random() * 1.5;
+                        x = Math.cos(angle) * radius; z = Math.sin(angle) * radius; y = (Math.random() - 0.5) * 0.1;
+                        const tilt = 0.4;
+                        const ty_ = y * Math.cos(tilt) - z * Math.sin(tilt);
+                        const tz_ = y * Math.sin(tilt) + z * Math.cos(tilt);
+                        y = ty_; z = tz_;
+                        r = 0.8; g = 0.7; b = 0.5;
+                    } else {
+                        const radius = 1.5;
+                        const phi = Math.acos(-1 + (2 * i) / (PARTICLE_COUNT * 0.6));
+                        const theta = Math.sqrt((PARTICLE_COUNT * 0.6) * Math.PI) * phi;
+                        x = radius * Math.cos(theta) * Math.sin(phi); y = radius * Math.sin(theta) * Math.sin(phi); z = radius * Math.cos(phi);
+                        r = 0.9; g = 0.8; b = 0.4;
+                    }
+                } 
+                else if (type === 'flower') {
+                    const u = Math.random() * Math.PI * 2;
+                    const v = Math.random() * Math.PI;
+                    const radius = (1.5 + Math.cos(4 * u)) * Math.sin(v) * 2;
+                    x = radius * Math.cos(u) * 0.6; z = radius * Math.sin(u) * 0.6; y = (Math.cos(v) * 1.5 + Math.sin(5*u)*0.5) * 0.6;
+                    r = userSelectedColor.r + (Math.random()-0.5)*0.2;
+                    g = userSelectedColor.g + (Math.random()-0.5)*0.2;
+                    b = userSelectedColor.b + (Math.random()-0.5)*0.2;
+                }
+                else if (type === 'fireworks') {
+                    const radius = 0.2 + Math.random() * 3;
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.random() * Math.PI;
+                    x = radius * Math.sin(phi) * Math.cos(theta); y = radius * Math.sin(phi) * Math.sin(theta); z = radius * Math.cos(phi);
+                    r = Math.random(); g = Math.random(); b = Math.random();
+                }
+
+                positions.push(x, y, z);
+                colors.push(r, g, b);
+            }
+
+            targetPositions = new Float32Array(positions);
+            particles.geometry.attributes.color.array.set(colors);
+            particles.geometry.attributes.color.needsUpdate = true;
+        }
+
+        // --- 4. 动画循环 ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const positions = particles.geometry.attributes.position.array;
+            const speed = 0.06;
+            const activeSpread = isDiffusionEnabled ? handInteraction.spread : 0;
+            const spreadFactor = activeSpread * 6.0;
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const ix = i * 3, iy = i * 3 + 1, iz = i * 3 + 2;
+                let tx = targetPositions[ix], ty = targetPositions[iy], tz = targetPositions[iz];
+
+                if (currentShape === 'fireworks') {
+                     const time = Date.now() * 0.0005;
+                     tx *= (1 + Math.sin(time + i) * 0.15);
+                     ty *= (1 + Math.cos(time + i) * 0.15);
+                }
+
+                if (currentShape === 'solar') {
+                    const dist = Math.sqrt(tx*tx + tz*tz);
+                    if (dist > 1.0) { 
+                        const angleSpeed = 0.002 / dist;
+                        const cos = Math.cos(angleSpeed);
+                        const sin = Math.sin(angleSpeed);
+                        const nx = tx * cos - tz * sin;
+                        const nz = tx * sin + tz * cos;
+                        tx = nx; tz = nz;
+                        targetPositions[ix] = tx;
+                        targetPositions[iz] = tz;
+                    }
+                }
+
+                if (spreadFactor > 0.01) {
+                    tx *= (1 + spreadFactor); ty *= (1 + spreadFactor); tz *= (1 + spreadFactor);
+                    tx += (Math.random() - 0.5) * spreadFactor;
+                    ty += (Math.random() - 0.5) * spreadFactor;
+                    tz += (Math.random() - 0.5) * spreadFactor;
+                }
+
+                positions[ix] += (tx - positions[ix]) * speed;
+                positions[iy] += (ty - positions[iy]) * speed;
+                positions[iz] += (tz - positions[iz]) * speed;
+            }
+            particles.geometry.attributes.position.needsUpdate = true;
+
+            if (!isDragging && !isPaused) {
+                targetRotation.x += momentum.x;
+                targetRotation.y += momentum.y;
+                momentum.x *= FRICTION;
+                momentum.y *= FRICTION;
+            }
+
+            particles.rotation.x += (targetRotation.x - particles.rotation.x) * 0.1;
+            particles.rotation.y += (targetRotation.y - particles.rotation.y) * 0.1;
+
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- 5. MediaPipe ---
+        function onResults(results) {
+            document.getElementById('loader').style.display = 'none';
+            if (isPaused) return;
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                const currentX = 1.0 - landmarks[9].x;
+                const currentY = landmarks[9].y;
+
+                if (!isDragging) {
+                    isDragging = true;
+                    previousHandPosition = { x: currentX, y: currentY };
+                    momentum = { x: 0, y: 0 };
+                } else {
+                    const deltaX = currentX - previousHandPosition.x;
+                    const deltaY = currentY - previousHandPosition.y;
+                    const sensitivity = 5.0;
+                    momentum.y = deltaX * sensitivity;
+                    momentum.x = deltaY * sensitivity;
+                    targetRotation.y += momentum.y;
+                    targetRotation.x += momentum.x;
+                    previousHandPosition = { x: currentX, y: currentY };
+                }
+
+                const wrist = landmarks[0];
+                const tips = [4, 8, 12, 16, 20];
+                let totalDist = 0;
+                tips.forEach(idx => {
+                    const tip = landmarks[idx];
+                    totalDist += Math.sqrt(Math.pow(tip.x - wrist.x, 2) + Math.pow(tip.y - wrist.y, 2));
+                });
+                const avgDist = totalDist / 5;
+                let openness = (avgDist - 0.15) / (0.45 - 0.15);
+                openness = Math.max(0, Math.min(1, openness));
+                handInteraction.spread = 1.0 - openness;
+                handInteraction.active = true;
+
+            } else {
+                if (isDragging) isDragging = false; 
+                if (handInteraction.spread > 0.01) handInteraction.spread *= 0.9;
+                else handInteraction.spread = 0;
+            }
+        }
+
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        hands.onResults(onResults);
+
+        const videoElement = document.getElementsByClassName('input_video')[0];
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 640, height: 480
+        });
+        cameraUtils.start();
+
+        // --- 6. UI 事件 ---
+        
+        document.getElementById('shape-selector').addEventListener('change', (e) => { 
+            currentShape = e.target.value; 
+            updateParticleSystem(currentShape); 
+        });
+
+        document.getElementById('color-picker').addEventListener('input', (e) => { 
+            userSelectedColor.set(e.target.value);
+            if (currentShape !== 'globe' && currentShape !== 'solar' && currentShape !== 'fireworks') {
+                updateParticleSystem(currentShape);
+            }
+        });
+
+        document.getElementById('diffusion-toggle').addEventListener('change', (e) => {
+            isDiffusionEnabled = e.target.checked;
+        });
+
+        const pauseBtn = document.getElementById('pause-btn');
+        pauseBtn.addEventListener('click', () => {
+            isPaused = !isPaused;
+            if (isPaused) {
+                pauseBtn.innerText = "▶ 继续识别";
+                pauseBtn.classList.add('paused');
+            } else {
+                pauseBtn.innerText = "⏸ 暂停识别";
+                pauseBtn.classList.remove('paused');
+                isDragging = false; 
+            }
+        });
+
+        document.getElementById('reset-btn').addEventListener('click', () => {
+            targetRotation = { x: 0, y: 0 };
+            momentum = { x: 0, y: 0 };
+            handInteraction.spread = 0;
+            isDragging = false;
+            
+            // 重置为默认：太阳系 & 天际蓝
+            currentShape = 'solar';
+            document.getElementById('shape-selector').value = 'solar';
+            userSelectedColor.set(0x1E90FF);
+            document.getElementById('color-picker').value = '#1E90FF';
+            
+            isDiffusionEnabled = true;
+            document.getElementById('diffusion-toggle').checked = true;
+
+            updateParticleSystem('solar');
+            if(isPaused) pauseBtn.click(); 
+        });
+
+        document.getElementById('fullscreen-btn').addEventListener('click', () => {
+            if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+            else if (document.exitFullscreen) document.exitFullscreen();
+        });
+
+        initThree();
+        animate();
+    </script>
+</body>
+</html>
